@@ -1,0 +1,371 @@
+#include <Arduino.h>
+#include <U8g2lib.h>
+#include <SPI.h>
+
+// Display pins for CFA10110 connections
+// CFA10110 (J2)  XIAO Pin   Function
+// 3V3            3V3        Power
+// GND            GND        Ground
+// D6 (SCK)       D7 (SCK)   SPI Clock
+// D7 (SDA)       D9 (MOSI)  SPI Data
+// CS (Pin 6)     D10        Chip Select
+// DC (Pin 5)     D8         Data/Command
+// RES (Pin 3)    D2         Reset
+#define DISPLAY_CLOCK_PIN  7   // SCK on D7
+#define DISPLAY_DATA_PIN   9   // MOSI on D9
+#define DISPLAY_CS_PIN     10  // Chip Select on D10
+#define DISPLAY_DC_PIN     8   // Data/Command on D8
+#define DISPLAY_RESET_PIN  2   // Reset on D2
+
+// LED pin for status
+#define LED_PIN           21  // Built-in LED on XIAO ESP32S3
+
+// Display dimensions
+#define DISPLAY_WIDTH     128
+#define DISPLAY_HEIGHT    64
+
+// Select which display constructor to use
+// Option 3: Try the NHD-C12864 driver - often works with Crystal Fontz displays
+U8G2_ST7565_NHD_C12864_F_4W_HW_SPI u8g2(
+  U8G2_R0, 
+  /* cs=*/     DISPLAY_CS_PIN, 
+  /* dc=*/     DISPLAY_DC_PIN, 
+  /* reset=*/  DISPLAY_RESET_PIN
+);
+
+// Current display test mode
+uint8_t testMode = 0;
+unsigned long lastModeChange = 0;
+
+// Display contrast (will be cycled)
+uint8_t displayContrast = 40; // Start with a lower value for ST7565
+
+/**
+ * Fill the entire screen with pixels
+ */
+void fillScreen() {
+  u8g2.clearBuffer();
+  
+  // Fill the entire display with pixels
+  for (int y = 0; y < DISPLAY_HEIGHT; y++) {
+    for (int x = 0; x < DISPLAY_WIDTH; x++) {
+      u8g2.drawPixel(x, y);
+    }
+  }
+  
+  u8g2.sendBuffer();
+  Serial.println("Screen filled with pixels");
+}
+
+/**
+ * Clear the entire screen
+ */
+void clearScreen() {
+  u8g2.clearBuffer();
+  u8g2.sendBuffer();
+  Serial.println("Screen cleared");
+}
+
+/**
+ * Draw a test pattern
+ */
+void drawTestPattern() {
+  u8g2.clearBuffer();
+  
+  // Draw a border around the entire display
+  u8g2.drawFrame(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+  
+  // Draw crossed lines
+  u8g2.drawLine(0, 0, DISPLAY_WIDTH-1, DISPLAY_HEIGHT-1);
+  u8g2.drawLine(0, DISPLAY_HEIGHT-1, DISPLAY_WIDTH-1, 0);
+  
+  // Draw a filled rectangle in the center
+  u8g2.drawBox(DISPLAY_WIDTH/2-15, DISPLAY_HEIGHT/2-10, 30, 20);
+  
+  // Draw circles
+  u8g2.drawCircle(DISPLAY_WIDTH/4, DISPLAY_HEIGHT/4, 10);
+  u8g2.drawDisc(3*DISPLAY_WIDTH/4, 3*DISPLAY_HEIGHT/4, 10);
+  
+  // Add some text
+  u8g2.setFont(u8g2_font_6x10_tr);
+  u8g2.drawStr(5, 15, "Display Test");
+  
+  // Send to display
+  u8g2.sendBuffer();
+  Serial.println("Test pattern displayed");
+}
+
+/**
+ * Draw horizontal stripes
+ */
+void drawHorizontalStripes() {
+  u8g2.clearBuffer();
+  
+  for (int y = 0; y < DISPLAY_HEIGHT; y += 4) {
+    u8g2.drawHLine(0, y, DISPLAY_WIDTH);
+  }
+  
+  u8g2.sendBuffer();
+  Serial.println("Horizontal stripes displayed");
+}
+
+/**
+ * Draw vertical stripes
+ */
+void drawVerticalStripes() {
+  u8g2.clearBuffer();
+  
+  for (int x = 0; x < DISPLAY_WIDTH; x += 4) {
+    u8g2.drawVLine(x, 0, DISPLAY_HEIGHT);
+  }
+  
+  u8g2.sendBuffer();
+  Serial.println("Vertical stripes displayed");
+}
+
+/**
+ * Draw a checkerboard pattern
+ */
+void drawCheckerboard() {
+  u8g2.clearBuffer();
+  
+  int blockSize = 8;
+  for (int y = 0; y < DISPLAY_HEIGHT; y += blockSize) {
+    for (int x = 0; x < DISPLAY_WIDTH; x += blockSize) {
+      if ((x/blockSize + y/blockSize) % 2 == 0) {
+        u8g2.drawBox(x, y, blockSize, blockSize);
+      }
+    }
+  }
+  
+  u8g2.sendBuffer();
+  Serial.println("Checkerboard pattern displayed");
+}
+
+/**
+ * Display current contrast value
+ */
+void showContrastScreen(uint8_t contrast) {
+  u8g2.clearBuffer();
+  
+  // Draw a border
+  u8g2.drawFrame(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+  
+  // Display contrast value
+  u8g2.setFont(u8g2_font_10x20_tr);
+  char buffer[20];
+  sprintf(buffer, "Contrast:%d", contrast);
+  u8g2.drawStr(10, 30, buffer);
+  
+  // Display contrast bar
+  u8g2.drawFrame(10, 40, 108, 10);
+  u8g2.drawBox(10, 40, map(contrast, 0, 255, 0, 108), 10);
+  
+  u8g2.sendBuffer();
+  Serial.printf("Contrast set to: %d\n", contrast);
+}
+
+/**
+ * Try sending direct commands to the ST7565 controller
+ * This bypasses the U8G2 library for initialization
+ */
+void sendDirectCommands() {
+  // Hardware reset
+  digitalWrite(DISPLAY_RESET_PIN, LOW);
+  delay(50);
+  digitalWrite(DISPLAY_RESET_PIN, HIGH);
+  delay(100);
+  
+  // Select chip
+  digitalWrite(DISPLAY_CS_PIN, LOW);
+  
+  // Send initialization commands
+  u8g2.sendF("ca", 0x0A2);  // LCD bias set to 1/9
+  u8g2.sendF("ca", 0x0A0);  // ADC normal
+  u8g2.sendF("ca", 0x0C8);  // COM scan direction normal
+  u8g2.sendF("ca", 0x040);  // Display start line 0
+  u8g2.sendF("ca", 0x028 | 0x04); // Power control: boost on
+  u8g2.sendF("ca", 0x028 | 0x06); // Power control: regulator on
+  u8g2.sendF("ca", 0x028 | 0x07); // Power control: follower on
+  u8g2.sendF("ca", 0x0A6);  // Display normal (not inverted)
+  u8g2.sendF("ca", 0x081);  // Set contrast command
+  u8g2.sendF("ca", displayContrast); // Contrast value
+  u8g2.sendF("ca", 0x0AF);  // Display on
+  
+  // Deselect chip
+  digitalWrite(DISPLAY_CS_PIN, HIGH);
+  
+  Serial.println("Sent direct ST7565 initialization commands");
+}
+
+/**
+ * Initialize SPI manually
+ */
+void initSPI() {
+  SPI.begin(DISPLAY_CLOCK_PIN, -1, DISPLAY_DATA_PIN, DISPLAY_CS_PIN);
+  SPI.setFrequency(1000000); // 1MHz
+  SPI.setBitOrder(MSBFIRST);
+  SPI.setDataMode(SPI_MODE0);
+  Serial.println("SPI initialized manually");
+}
+
+/**
+ * Try different display initialization commands
+ */
+void initializeDisplayWithOptions() {
+  // Initialize pins as outputs
+  pinMode(DISPLAY_RESET_PIN, OUTPUT);
+  pinMode(DISPLAY_DC_PIN, OUTPUT);
+  pinMode(DISPLAY_CS_PIN, OUTPUT);
+  
+  // Initialize SPI
+  initSPI();
+  
+  // Begin display with U8G2
+  Serial.println("Starting u8g2.begin()");
+  u8g2.begin();
+  
+  // Try with power save mode disabled
+  u8g2.setPowerSave(0);
+  
+  // Try different rotation and flip options
+  // Test with both normal and flipped modes
+  bool isFlipped = false;
+  u8g2.setFlipMode(isFlipped ? 1 : 0);
+  
+  // Try all four rotations
+  u8g2.setDisplayRotation(U8G2_R0);
+  
+  // Set contrast
+  u8g2.setContrast(displayContrast);
+  Serial.printf("Display contrast set to: %d\n", displayContrast);
+  
+  // Try direct initialization as well
+  sendDirectCommands();
+}
+
+void setup() {
+  // Initialize serial communication
+  Serial.begin(115200);
+  delay(300);
+  
+  // Print a clear separator for the log
+  Serial.println("\n\n====================================================");
+  Serial.println("CFA10110 Display Test with NHD-C12864 HW SPI Driver");
+  Serial.println("====================================================");
+  
+  // Initialize status LED
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);
+  
+  // Print the display pin configuration
+  Serial.println("Display pins:");
+  Serial.printf("SCK: %d, MOSI: %d, CS: %d, DC: %d, RESET: %d\n", 
+               DISPLAY_CLOCK_PIN, DISPLAY_DATA_PIN, DISPLAY_CS_PIN, 
+               DISPLAY_DC_PIN, DISPLAY_RESET_PIN);
+  
+  // Initialize display with various options
+  Serial.println("Initializing CFA10110 display with NHD-C12864 driver...");
+  initializeDisplayWithOptions();
+  
+  // Initial display content - very basic pattern to start
+  u8g2.clearBuffer();
+  
+  // Draw a simple frame
+  u8g2.drawFrame(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+  
+  // Draw crossed lines
+  u8g2.drawLine(0, 0, DISPLAY_WIDTH-1, DISPLAY_HEIGHT-1);
+  u8g2.drawLine(0, DISPLAY_HEIGHT-1, DISPLAY_WIDTH-1, 0);
+  
+  // Send to display
+  u8g2.sendBuffer();
+  
+  Serial.println("Display initialization pattern sent");
+  
+  // Short delay to show the initialization message
+  delay(2000);
+  
+  // Blink LED to indicate test patterns will begin
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(100);
+    digitalWrite(LED_PIN, LOW);
+    delay(100);
+  }
+  
+  // Initialize timing for mode changes
+  lastModeChange = millis();
+  
+  // Start with filling the screen
+  fillScreen();
+}
+
+void loop() {
+  // Toggle LED to visualize activity
+  digitalWrite(LED_PIN, millis() % 1000 < 500 ? HIGH : LOW);
+  
+  // Every 10 seconds, try a different contrast value
+  if (millis() % 10000 < 100) {
+    displayContrast = (displayContrast + 40) % 256;
+    u8g2.setContrast(displayContrast);
+    Serial.printf("Changed display contrast to: %d\n", displayContrast);
+  }
+  
+  // Automatically cycle through test patterns every 5 seconds
+  if (millis() - lastModeChange > 5000) {
+    testMode = (testMode + 1) % 8;
+    lastModeChange = millis();
+    
+    // Print the current test mode
+    Serial.printf("Switching to test mode: %d\n", testMode);
+  }
+  
+  // Display the current test pattern based on mode
+  switch (testMode) {
+    case 0:
+      // All pixels ON
+      fillScreen();
+      break;
+    
+    case 1:
+      // All pixels OFF
+      clearScreen();
+      break;
+    
+    case 2:
+      // Test pattern with various elements
+      drawTestPattern();
+      break;
+    
+    case 3:
+      // Horizontal stripes
+      drawHorizontalStripes();
+      break;
+    
+    case 4:
+      // Vertical stripes
+      drawVerticalStripes();
+      break;
+    
+    case 5:
+      // Checkerboard pattern
+      drawCheckerboard();
+      break;
+    
+    case 6:
+      // Contrast test - low
+      u8g2.setContrast(20);
+      showContrastScreen(20);
+      break;
+    
+    case 7:
+      // Contrast test - high
+      u8g2.setContrast(60);
+      showContrastScreen(60);
+      break;
+  }
+  
+  // Small delay to avoid overloading the serial port
+  delay(500);
+} 

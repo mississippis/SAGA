@@ -1,0 +1,311 @@
+#include <Arduino.h>
+#include <U8g2lib.h>
+#include <Wire.h>
+#include <SPI.h>
+#include "esp_camera.h"
+
+// ===== PIN DEFINITIONS FOR SEEED XIAO ESP32S3 ======
+// LCD Display Pins - Using Hardware SPI
+#define LCD_RESET  7   // GPIO7 (D6) - Reset
+#define LCD_DC     5   // GPIO5 (D4) - Data/Command
+#define LCD_CS     6   // GPIO6 (D5) - Chip Select
+#define LCD_SCK    10  // GPIO10 (D9) - SPI Clock
+#define LCD_MOSI   11  // GPIO11 (D10) - SPI Data Out
+
+// LED Pin for Status Indication
+#define LED_PIN    21  // Built-in LED on XIAO ESP32S3
+
+// Using ST7565 driver for the CFAG12864 display - we'll use the controller that works best
+// based on testing with display_test.cpp
+U8G2_ST7565_ERC12864_F_4W_HW_SPI u8g2(U8G2_R0, LCD_CS, LCD_DC, LCD_RESET);
+
+// Brightness Threshold (Adjust as needed)
+#define BRIGHTNESS_THRESHOLD 200
+
+// ===== CAMERA CONFIGURATION FOR XIAO ESP32S3 =====
+// Camera pin definitions appropriate for XIAO ESP32S3 Sense
+#define PWDN_GPIO_NUM     -1
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM     45
+#define SIOD_GPIO_NUM     40
+#define SIOC_GPIO_NUM     39
+#define Y9_GPIO_NUM       48
+#define Y8_GPIO_NUM       11
+#define Y7_GPIO_NUM       12
+#define Y6_GPIO_NUM       14
+#define Y5_GPIO_NUM       16
+#define Y4_GPIO_NUM       18
+#define Y3_GPIO_NUM       17
+#define Y2_GPIO_NUM       15
+#define VSYNC_GPIO_NUM    38
+#define HREF_GPIO_NUM     47
+#define PCLK_GPIO_NUM     13
+
+// Current contrast setting
+int currentContrast = 160; // Starting contrast value
+
+/**
+ * Initialize the on-board camera of the XIAO ESP32S3 Sense
+ * @return true if camera initialization was successful
+ */
+bool setupCamera() {
+    camera_config_t config;
+    config.ledc_channel = LEDC_CHANNEL_0;
+    config.ledc_timer = LEDC_TIMER_0;
+    config.pin_d0 = Y2_GPIO_NUM;
+    config.pin_d1 = Y3_GPIO_NUM;
+    config.pin_d2 = Y4_GPIO_NUM;
+    config.pin_d3 = Y5_GPIO_NUM;
+    config.pin_d4 = Y6_GPIO_NUM;
+    config.pin_d5 = Y7_GPIO_NUM;
+    config.pin_d6 = Y8_GPIO_NUM;
+    config.pin_d7 = Y9_GPIO_NUM;
+    config.pin_xclk = XCLK_GPIO_NUM;
+    config.pin_pclk = PCLK_GPIO_NUM;
+    config.pin_vsync = VSYNC_GPIO_NUM;
+    config.pin_href = HREF_GPIO_NUM;
+    config.pin_sscb_sda = SIOD_GPIO_NUM;
+    config.pin_sscb_scl = SIOC_GPIO_NUM;
+    config.pin_pwdn = PWDN_GPIO_NUM;
+    config.pin_reset = RESET_GPIO_NUM;
+    config.xclk_freq_hz = 20000000;
+    config.pixel_format = PIXFORMAT_GRAYSCALE;
+    config.frame_size = FRAMESIZE_QQVGA;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
+
+    esp_err_t err = esp_camera_init(&config);
+    if (err != ESP_OK) {
+        Serial.printf("Camera init failed with error 0x%x\n", err);
+        return false;
+    }
+    
+    Serial.println("Camera initialized successfully");
+    return true;
+}
+
+/**
+ * Analyze camera image to detect bright light
+ * @return true if average brightness is above threshold
+ */
+bool isBrightLightDetected() {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+        Serial.println("Camera capture failed");
+        return false;
+    }
+
+    // Calculate average brightness across all pixels
+    uint32_t totalBrightness = 0;
+    for (size_t i = 0; i < fb->len; i++) {
+        totalBrightness += fb->buf[i];
+    }
+    
+    // Return the buffer to the camera driver
+    esp_camera_fb_return(fb);
+    
+    // Calculate average brightness
+    uint32_t avgBrightness = totalBrightness / fb->len;
+    
+    Serial.printf("Average brightness: %u\n", avgBrightness);
+    
+    // Return true if brightness is above threshold
+    return avgBrightness > BRIGHTNESS_THRESHOLD;
+}
+
+/**
+ * Initialize the display with optimal settings for CFAG12864
+ */
+void initializeDisplay() {
+    // Start with hardware setup
+    pinMode(LCD_RESET, OUTPUT);
+    digitalWrite(LCD_RESET, LOW);  // Reset the display
+    delay(50);
+    digitalWrite(LCD_RESET, HIGH); // Release reset
+    delay(100);
+    
+    // Initialize SPI bus explicitly
+    SPI.begin(LCD_SCK, -1, LCD_MOSI, LCD_CS);
+    
+    // Initialize the display
+    u8g2.begin();
+    
+    // Specific settings for CFAG12864 with ST7565 controller
+    u8g2.setContrast(currentContrast);  // Set initial contrast
+    u8g2.setFlipMode(0);    // Don't flip the display 
+    
+    // Additional initialization - sending specific commands for ST7565
+    u8g2.sendF("ca", 0xA3, 0);  // LCD bias set to 1/7
+    u8g2.sendF("ca", 0xA0, 0);  // ADC normal
+    u8g2.sendF("ca", 0xC8, 0);  // COM scan in reverse direction
+    u8g2.sendF("ca", 0x25, 0);  // Resistor ratio = 2
+    u8g2.sendF("ca", 0x81, 0);  // Electronic volume command
+    u8g2.sendF("ca", currentContrast & 0x3F, 0);  // Electronic volume value
+    u8g2.sendF("ca", 0x2F, 0);  // Power control set
+    
+    Serial.printf("Display initialized with contrast %d\n", currentContrast);
+}
+
+/**
+ * Adjust contrast
+ */
+void adjustContrast(int delta) {
+    currentContrast += delta;
+    if (currentContrast < 0) currentContrast = 0;
+    if (currentContrast > 255) currentContrast = 255;
+    
+    u8g2.setContrast(currentContrast);
+    Serial.printf("Contrast set to %d\n", currentContrast);
+}
+
+/**
+ * Display normal mode screen
+ */
+void showNormalScreen() {
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_ncenB10_tr);
+    u8g2.drawStr(20, 24, "Normal Mode");
+    
+    // Draw a simple border
+    u8g2.drawFrame(0, 0, 128, 64);
+    
+    // Draw a small icon or graphic
+    u8g2.drawCircle(64, 40, 8);
+    u8g2.drawDisc(64, 40, 4);
+    
+    u8g2.sendBuffer();
+}
+
+/**
+ * Display blocking screen when bright light is detected
+ */
+void showBlockingScreen() {
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_ncenB10_tr);
+    u8g2.drawStr(5, 24, "Light Detected!");
+    u8g2.setFont(u8g2_font_ncenB08_tr);
+    u8g2.drawStr(15, 40, "Blocking Screen");
+    
+    // Create a cross-hatched pattern to represent blocking
+    for (uint8_t y = 0; y < 64; y += 4) {
+        u8g2.drawLine(0, y, 127, y);
+    }
+    for (uint8_t x = 0; x < 128; x += 4) {
+        u8g2.drawLine(x, 0, x, 63);
+    }
+    
+    u8g2.sendBuffer();
+}
+
+/**
+ * Display welcome/startup screen
+ */
+void showStartupScreen() {
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_ncenB10_tr);
+    u8g2.drawStr(5, 20, "System Ready");
+    u8g2.setFont(u8g2_font_ncenB08_tr);
+    u8g2.drawStr(15, 40, "Light Detection Active");
+    u8g2.sendBuffer();
+}
+
+void setup() {
+    // Initialize serial communication
+    Serial.begin(115200);
+    delay(1000); // Give time for serial to connect
+    
+    Serial.println("\n\n==========================================");
+    Serial.println("XIAO ESP32S3 Transparent LCD + Light Detection");
+    Serial.println("==========================================");
+    
+    // Initialize LED pin for status indication
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, HIGH); // Turn on LED to indicate startup
+    
+    // Initialize the display
+    initializeDisplay();
+    Serial.println("Display initialized");
+    
+    // Initialize the camera
+    if (!setupCamera()) {
+        // If camera setup fails, blink the LED rapidly and show error on display
+        Serial.println("ERROR: Could not initialize camera!");
+        
+        u8g2.clearBuffer();
+        u8g2.setFont(u8g2_font_ncenB10_tr);
+        u8g2.drawStr(10, 24, "Camera Error");
+        u8g2.setFont(u8g2_font_ncenB08_tr);
+        u8g2.drawStr(5, 40, "Check connections");
+        u8g2.sendBuffer();
+        
+        while (1) {
+            digitalWrite(LED_PIN, HIGH);
+            delay(100);
+            digitalWrite(LED_PIN, LOW);
+            delay(100);
+        }
+    }
+    
+    // Display startup message
+    showStartupScreen();
+    delay(2000); // Display startup message for 2 seconds
+    
+    digitalWrite(LED_PIN, LOW); // Turn off LED after startup
+    
+    Serial.println("Setup complete - monitoring light levels");
+    Serial.println("Commands:");
+    Serial.println("'+' - Increase contrast");
+    Serial.println("'-' - Decrease contrast");
+    Serial.println("'r' - Reset display");
+    Serial.println("==========================================");
+}
+
+unsigned long lastToggleTime = 0;
+bool ledState = false;
+
+void loop() {
+    // Check for serial commands
+    if (Serial.available() > 0) {
+        char input = Serial.read();
+        
+        // Process commands
+        switch (input) {
+            case '+':  // Increase contrast
+                adjustContrast(10);
+                break;
+                
+            case '-':  // Decrease contrast
+                adjustContrast(-10);
+                break;
+                
+            case 'r':  // Reset display
+                initializeDisplay();
+                break;
+        }
+    }
+    
+    // Check for bright light
+    bool brightLightDetected = isBrightLightDetected();
+    
+    // Update LED status based on light detection
+    digitalWrite(LED_PIN, brightLightDetected ? HIGH : LOW);
+    
+    // Update display based on light detection
+    if (brightLightDetected) {
+        showBlockingScreen();
+        
+        // Only print alert message when state changes to prevent flooding serial
+        if (!ledState) {
+            Serial.println("ALERT: Bright light detected - blocking screen");
+        }
+        ledState = true;
+    } else {
+        showNormalScreen();
+        ledState = false;
+    }
+    
+    // Delay between readings to prevent overwhelming the serial output
+    // and to give time for display updates
+    delay(500);
+} 
